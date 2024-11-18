@@ -4,3 +4,4 @@ vecstore/
 pystack/
 data/
 .env
+*.rest

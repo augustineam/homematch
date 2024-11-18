@@ -1,13 +1,14 @@
-from langchain_community.document_loaders import CSVLoader
 from langchain.indexes import SQLRecordManager, index
-
 from langchain_chroma import Chroma
 from langchain_aws import ChatBedrockConverse
-from langchain_openai import OpenAIEmbeddings
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.embeddings import Embeddings
+from langchain_core.documents import Document
+from langchain_community.document_loaders import CSVLoader
+
 from pydantic import BaseModel
 
-from typing import Literal, List
+from typing import Literal, List, Union
 from PIL import Image, ImageFile
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import boto3
 import json
 import base64
 import io
+import os
 
 
 class ImagePrompt(BaseModel):
@@ -34,7 +36,12 @@ VECSTORE_PATH = Path("vecstore")
 VECSTORE_PATH.mkdir(parents=True, exist_ok=True)
 
 
-def get_vector_store(path: str, csv_path: str) -> Chroma:
+def get_vector_store(
+    path: str,
+    csv_path: str,
+    collection_name: str,
+    embeddings: Embeddings,
+) -> Chroma:
     """Get the application vector store.
 
     This function creates a vector store from the CSV file at the given path.
@@ -49,8 +56,10 @@ def get_vector_store(path: str, csv_path: str) -> Chroma:
         LanceDB: The vector store.
     """
 
+    os.makedirs(path, exist_ok=True)
+
     # Create the vector store
-    vector_store = Chroma(COLLECTION_NAME, OpenAIEmbeddings(), persist_directory=path)
+    vector_store = Chroma(collection_name, embeddings, persist_directory=path)
 
     # Load the data
     loader = CSVLoader(file_path=csv_path)
@@ -64,7 +73,7 @@ def get_vector_store(path: str, csv_path: str) -> Chroma:
 
     # The record manager is used to keep an index of the documents already added
     record_manager = SQLRecordManager(
-        f"chroma/{COLLECTION_NAME}",
+        f"chroma/{collection_name}",
         db_url=f"sqlite:///{path}/record_manager_cache.sql",
     )
     record_manager.create_schema()
@@ -73,6 +82,49 @@ def get_vector_store(path: str, csv_path: str) -> Chroma:
     index(loader.load(), record_manager, vector_store, source_id_key="row")
 
     return vector_store
+
+
+from langchain_core.tools import tool, create_retriever_tool, Tool
+
+
+def get_retriever_tool(
+    property_listings: Chroma, listing_images: Union[Chroma, None] = None
+) -> Tool:
+    listing_retriever = property_listings.as_retriever()
+    if listing_images is None:
+        return create_retriever_tool(
+            listing_retriever,
+            "retrieve_property_listings",
+            "Queries and returns documents regarding property listings.",
+        )
+
+    @tool
+    def retriever_with_images(query: str):
+        """Queries and returns documents regarding property listings.
+        The documents include the filepaths to the listing images.
+
+        Args:
+            query (str): The query string used to retrieve the most relevant documents
+
+        Returns:
+            str: The retrieved data including the most eye catchin image based on the query
+        """
+
+        docs: List[Document] = listing_retriever.invoke(query)
+
+        # Get most eye catching image based on the query but for
+        # the related document
+        image_idx = []
+        for doc in docs:
+            row = doc.metadata["row"]
+            img_doc = listing_images.similarity_search(
+                query, k=1, filter={"row": {"$eq": row}}
+            )[0]
+            image_idx.append(img_doc.metadata["pdx"])
+
+        return "\n\n".join(doc.page_content + "" for doc in docs)
+
+    return retriever_with_images
 
 
 def gen_txt2img_prompts(description: str) -> List[ImagePrompt]:

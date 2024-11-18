@@ -1,4 +1,4 @@
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.tools import create_retriever_tool, tool
 from langchain_core.messages import (
@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from typing import Annotated, Dict, List, Literal, Union
 from dotenv import load_dotenv
 
-from .utils import get_vector_store, CSV_PATH
+from .utils import get_vector_store
 
 import click
 import asyncio
@@ -50,7 +50,9 @@ def HomeMatchAgent(vecstore_path: str, csv_path: str) -> CompiledStateGraph:
     if __hmgraph:
         return __hmgraph
 
-    vecstore = get_vector_store(vecstore_path, csv_path)
+    vecstore = get_vector_store(
+        vecstore_path, csv_path, "property_listings", OpenAIEmbeddings()
+    )
 
     retriever_tool = create_retriever_tool(
         vecstore.as_retriever(),
@@ -257,30 +259,138 @@ async def cli_achat(vecstore_path: str, csv_path: str):
         input_message = HumanMessage(content=user_input)
 
 
-@click.command()
-@click.option(
-    "--terminal",
-    default=True,
-    help="Start agent from terminal",
-    is_flag=True,
-    show_default=True,
-)
+@click.group()
 @click.option(
     "--vecstore",
     default="./vecstore",
     help="Path to vector store",
     show_default=True,
 )
+@click.pass_context
+def start(ctx: click.Context, vecstore: str):
+    """Start HomeMatch AI agent"""
+    ctx.obj["vecstore"] = vecstore
+
+
+@click.command()
+@click.pass_context
+def cli(ctx: click.Context):
+    """Chat with the HomeMatch agent in the command line interface."""
+
+    vecstore = ctx.obj["vecstore"]
+    properties_csv = ctx.obj["properties_csv"]
+
+    asyncio.run(cli_achat(vecstore, properties_csv))
+
+
+@click.command()
 @click.option(
-    "--csv-path",
-    default=str(CSV_PATH),
-    help="Path to the CSV property listings file",
+    "--port",
+    default=8080,
+    help="Port to run the server on.",
     show_default=True,
 )
-def chat(terminal: bool, vecstore: str, csv_path: str):
-    """Start HomeMatch AI agent"""
+@click.option(
+    "--host",
+    default="localhost",
+    help="Host to run the server on.",
+    show_default=True,
+)
+@click.pass_context
+def fastapi(ctx: click.Context, port: int, host: str):
+    """Serve HomeMatch agent as an API endopoint with LangServe and use the `/playground`."""
 
-    if not terminal:
-        raise NotImplementedError("Only terminal mode supported")
+    from fastapi import FastAPI
+    from langserve import add_routes
+    from langchain_core.runnables import RunnableLambda
 
-    asyncio.run(cli_achat(vecstore, csv_path))
+    from src.agent import HomeMatchAgent
+    from typing import Tuple
+
+    import uvicorn
+
+    app = FastAPI(
+        title="HomeMatch Server",
+        version="1.0",
+        description="A Real State AI Agent to help users find the house of their dreams.",
+    )
+
+    # from starlette.routing import Mount
+    # from starlette.applications import Starlette
+    # from starlette.staticfiles import StaticFiles
+    # app.mount("/", app=StaticFiles(directory="ui", html=True), name="HomeMatchUI")
+
+    vecstore = ctx.obj["vecstore"]
+    properties_csv = ctx.obj["properties_csv"]
+
+    class InputChat(BaseModel):
+        """Input for the chat endpoint."""
+
+        messages: List[Union[HumanMessage, AIMessage, SystemMessage]] = Field(
+            ...,
+            description="The chat messages representing the current conversation.",
+        )
+
+    def oup(state: Union[Dict, List]) -> str:
+        """Parse agent output and return its response.
+
+        The LangGraph can return either the `agent` (dict) update or
+        the `summarize` and `agent` updates (list)
+        """
+
+        if isinstance(state, list):
+            filterout = [s for s in state if s.get("agent", None)]
+            if 0 < len(filterout):
+                agent = filterout[0]["agent"]
+        elif isinstance(state, dict) and "agent" in state:
+            agent = state["agent"]
+        else:
+            return ""
+
+        messages = [m for m in agent["messages"] if isinstance(m, AIMessage)]
+        return messages[-1].content
+
+    config = dict(configurable=dict(thread_id=4))
+    agent = HomeMatchAgent(vecstore, properties_csv).pipe(RunnableLambda(oup))
+    add_routes(
+        app,
+        agent.with_config(config).with_types(input_type=InputChat, output_type=str),
+        enable_feedback_endpoint=True,
+        enable_public_trace_link_endpoint=True,
+        playground_type="chat",
+    )
+    uvicorn.run(app, host=host, port=port)
+
+
+@click.command()
+@click.pass_context
+def gradio(ctx: click.Context):
+    """Chat with the HomeMatch using the gradio UI."""
+    import gradio as gr
+
+    vecstore = ctx.obj["vecstore"]
+    properties_csv = ctx.obj["properties_csv"]
+
+    config = dict(configurable=dict(thread_id=4))
+    agent = HomeMatchAgent(vecstore, properties_csv)
+
+    async def invoke_agent(message, history):
+        print(message, history)
+
+        input_message = HumanMessage(content=message["text"])
+        output = await agent.ainvoke(dict(messages=[input_message]), config)
+
+        return (
+            output["messages"][-1].content
+            + '<br/><img src="http://localhost:7860/gradio_api/file=/tmp/gradio/8a5d4a95a69e808a9a63066481123df93b849b7775441ac8cb42b89215f1d4d7/pdx_6.png" alt="Building image"/>'
+        )
+
+    demo = gr.ChatInterface(
+        invoke_agent, multimodal=True, type="messages", title="HomeMatch Agent"
+    )
+    demo.launch()
+
+
+start.add_command(cli)
+start.add_command(fastapi)
+start.add_command(gradio)

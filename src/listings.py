@@ -57,7 +57,7 @@ def listings():
     help="Number of properties to generate",
 )
 @click.option(
-    "--output-path",
+    "--properties-csv",
     default="./data/properties.csv",
     help="Path to save the generated properties",
 )
@@ -68,7 +68,7 @@ def listings():
     is_flag=True,
     show_default=True,
 )
-def create(num_properties: int, output_path: str, append: bool):
+def create(num_properties: int, properties_csv: str, append: bool):
     """Create fake property listings"""
 
     def parse_output(text):
@@ -98,7 +98,7 @@ def create(num_properties: int, output_path: str, append: bool):
     # Create a chain that will generate the listings and parse the output
     chain = llm | parse_output
 
-    csv_path = Path(output_path)
+    csv_path = Path(properties_csv)
 
     # If folder does not exist, create it
     if not csv_path.parent.exists():
@@ -129,7 +129,7 @@ def create(num_properties: int, output_path: str, append: bool):
 
                 # Save the dataframe to a csv file
                 out_df.to_csv(
-                    output_path,
+                    properties_csv,
                     mode=csv_mode,
                     header=not csv_path.exists(),
                     index=False,
@@ -143,7 +143,7 @@ def create(num_properties: int, output_path: str, append: bool):
 
 @click.command()
 @click.option(
-    "--property-csv",
+    "--properties-csv",
     default=str(CSV_PATH),
     help="Path to the CSV property listings file",
     show_default=True,
