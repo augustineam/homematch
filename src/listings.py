@@ -1,6 +1,5 @@
 from langchain_openai import OpenAI
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_community.document_loaders import CSVLoader
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, NonNegativeInt, NonNegativeFloat
@@ -9,8 +8,8 @@ from tqdm import tqdm
 from typing import List
 from pathlib import Path
 
-from .agent import CSV_PATH
-from .utils import gen_image, gen_txt2img_prompts
+from .utils import CSV_PATH
+from .utils import gen_txt2img_prompts, gen_image
 
 import click
 import pandas as pd
@@ -35,7 +34,7 @@ class Property(BaseModel):
         description="The 1-2 sentence description of the property, including any relevant details"
     )
     neighborhood_desc: str = Field(
-        description="THe 1-2 sentence description of the neighborhood, including any relevant details"
+        description="The 1-2 sentence description of the neighborhood, including any relevant details"
     )
 
 
@@ -45,10 +44,20 @@ class PropertyList(BaseModel):
     properties: List[Property]
 
 
+@click.group()
+def listings():
+    """Commands for working with property listings"""
+    pass
+
+
 @click.command()
-@click.option("--num_properties", default=100, help="Number of properties to generate")
 @click.option(
-    "--output_path",
+    "--num-properties",
+    default=100,
+    help="Number of properties to generate",
+)
+@click.option(
+    "--output-path",
     default="./data/properties.csv",
     help="Path to save the generated properties",
 )
@@ -59,7 +68,7 @@ class PropertyList(BaseModel):
     is_flag=True,
     show_default=True,
 )
-def create_listings(num_properties: int, output_path: str, append: bool):
+def create(num_properties: int, output_path: str, append: bool):
     """Create fake property listings"""
 
     def parse_output(text):
@@ -132,75 +141,131 @@ def create_listings(num_properties: int, output_path: str, append: bool):
                 continue
 
 
-from langchain_aws import BedrockEmbeddings
-
-
 @click.command()
 @click.option(
-    "--csv-data",
+    "--property-csv",
     default=str(CSV_PATH),
     help="Path to the CSV property listings file",
     show_default=True,
 )
-def listing_images(csv_data: str):
-    """Generate images for property listings"""
+@click.option(
+    "--imgprompts-csv",
+    default="data/imgprompts.csv",
+    help="Path to the listings' image generation prompts",
+    show_default=True,
+)
+def image_prompts(properties_csv: str, imgprompts_csv: str):
+    """Create prompts for generating listing images"""
 
-    path = Path(csv_data)
+    properties_path = Path(properties_csv)
+    if not properties_path.exists():
+        raise FileNotFoundError(f"File {properties_csv} does not exist")
 
-    loader = CSVLoader(file_path=path)
-    docs = loader.load()
+    imgprompts_path = Path(imgprompts_csv)
 
-    img_path = path.parent / "images"
-    img_path.mkdir(exist_ok=True)
+    properties_df = pd.read_csv(properties_path)
+    imgprompts_df = pd.read_csv(imgprompts_path) if imgprompts_path.exists() else None
 
-    embedds_csv = path.parent / "images" / "embeddings.csv"
-    total_docs = len(docs)
+    # To continue from the last row of the imgprompts csv file
+    offset_rows = imgprompts_df.iloc[-1]["row"] + 1 if imgprompts_path.exists() else 0
 
-    embeddings = BedrockEmbeddings(model="amazon.titan-embed-text-v2:0")
-
-    from langchain_community.vectorstores import LanceDB
-
-    # We'll use this embeddings dataframe to store prompt embeddigns
-    # and use it to copy an image generated already if the prompt is similar
-    # to another one already generated
-    df_embeddings = None
-    # for doc in docs[44:]:
-    for doc in docs[:44]:
-        row = doc.metadata["row"]
-
-        # row_imgs = img_path / f"row_{row:05d}"
-        # row_imgs.mkdir(exist_ok=True)
+    for i, row in tqdm(
+        properties_df.iloc[offset_rows:].iterrows(),
+        initial=offset_rows,
+        total=len(properties_df),
+    ):
 
         try:
-            # Generate prompts for the listing
-            prompts = gen_txt2img_prompts(doc.page_content)
-            # total_prompts = len(prompts)
+            # Format listing description as it if were a
+            # vector store document
+            doc_lines = []
+            for k, v in row.to_dict().items():
+                doc_lines.append(": ".join([k, str(v)]))
+            listing_description = "\n".join(doc_lines)
 
-            for i, p in enumerate(prompts):
-                print(f"{row + 1}/{total_docs} - {i + 1}/{len(prompts)}: {p}")
+            # Create the text to image prompts based on the
+            # listing description
+            prompts = gen_txt2img_prompts(listing_description)
 
-                df = pd.DataFrame(
-                    data=dict(
-                        row=row,
-                        pdx=i,
-                        type=p.type,
-                        prompt=p.prompt,
-                        embedding=[embeddings.invoke(p.prompt)],
-                    )
+            # Append each prompt to the end of the dataframe
+            prompts_df = None
+            for pdx, p in enumerate(prompts):
+                rowdf = pd.DataFrame(
+                    dict(id=f"{i}_{pdx}", row=i, pdx=pdx, **p.model_dump()), index=[0]
+                )
+                prompts_df = (
+                    rowdf
+                    if prompts_df is None
+                    else pd.concat([prompts_df, rowdf], ignore_index=True)
                 )
 
-                df_embeddings = pd.concat([df_embeddings, df]) if df_embeddings else df
-                df_embeddings.to_csv(
-                    embedds_csv,
-                    mode="a",
-                    header=not embedds_csv.exists(),
-                    index=False,
-                )
+            # Save the prompts_df
+            prompts_df.to_csv(
+                imgprompts_csv,
+                mode="a+",
+                header=not imgprompts_path.exists(),
+                index=False,
+            )
 
-            # # Generate images for each prompt
-            # for i, p in enumerate(prompts):
-            #     print(f"{row + 1}/{total_docs} - {i + 1}/{total_prompts}: {p.prompt}")
-            #     image = gen_image(p.prompt)
-            #     image.save(row_imgs / f"{p.type}_{i}.png")
-        except:
-            print(f"Error: generating image for listing at row {row}")
+        except Exception as e:
+            print(f"Error ({e}): for row index {i}")
+
+
+import random
+
+
+@click.command()
+@click.option(
+    "--prompts-csv",
+    default="data/imgprompts.csv",
+    help="Path to the listings' image generation prompts",
+    show_default=True,
+)
+@click.option(
+    "--image-path",
+    default="data/images",
+    help="Path to save generated images",
+    show_default=True,
+)
+def generate_images(prompts_csv: str, image_path: str):
+    """Generate images from text prompts"""
+
+    prompts_path = Path("data/imgprompts.csv")
+    if not prompts_path.exists():
+        raise FileNotFoundError(f"File {prompts_csv} not found.")
+
+    output_path = Path(image_path)
+    output_path.mkdir(exist_ok=True)
+
+    df_prompts = pd.read_csv(prompts_csv)
+
+    row = 0
+    seed = random.randint(0, 1000000)
+
+    for _, row_data in tqdm(
+        df_prompts.iterrows(),
+        total=len(df_prompts),
+        desc="Generating Images",
+        unit="img",
+    ):
+        if row_data["row"] != row:
+            row = row_data["row"]
+            seed = random.randint(0, 1000000)
+        pdx = row_data["pdx"]
+
+        png_path = output_path / f"row_{row:05d}/pdx_{pdx}.png"
+        png_path.parent.mkdir(exist_ok=True)
+
+        if png_path.exists():
+            continue
+
+        try:
+            image = gen_image(row_data["prompt"], seed)
+            image.save(png_path)
+        except Exception as e:
+            print(f"Error ({e}): for row {row} and prompt {pdx}")
+
+
+listings.add_command(create)
+listings.add_command(image_prompts)
+listings.add_command(generate_images)

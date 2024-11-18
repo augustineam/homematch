@@ -1,5 +1,5 @@
 from src.agent import chat
-from src.listings import create_listings, listing_images
+from src.listings import listings
 
 import click
 
@@ -9,9 +9,8 @@ def cli():
     pass
 
 
-cli.add_command(create_listings)
 cli.add_command(chat)
-cli.add_command(listing_images)
+cli.add_command(listings)
 
 if __name__ == "__main__":
     cli()

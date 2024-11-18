@@ -1,7 +1,7 @@
 from langchain_community.document_loaders import CSVLoader
-from langchain_community.vectorstores import LanceDB
 from langchain.indexes import SQLRecordManager, index
 
+from langchain_chroma import Chroma
 from langchain_aws import ChatBedrockConverse
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.output_parsers import PydanticOutputParser
@@ -34,7 +34,7 @@ VECSTORE_PATH = Path("vecstore")
 VECSTORE_PATH.mkdir(parents=True, exist_ok=True)
 
 
-def get_vector_store(path: str, csv_path: str) -> LanceDB:
+def get_vector_store(path: str, csv_path: str) -> Chroma:
     """Get the application vector store.
 
     This function creates a vector store from the CSV file at the given path.
@@ -50,30 +50,27 @@ def get_vector_store(path: str, csv_path: str) -> LanceDB:
     """
 
     # Create the vector store
-    vector_store = LanceDB(
-        embedding=OpenAIEmbeddings(), uri=path, table_name=COLLECTION_NAME
-    )
+    vector_store = Chroma(COLLECTION_NAME, OpenAIEmbeddings(), persist_directory=path)
 
     # Load the data
     loader = CSVLoader(file_path=csv_path)
-
-    # NOTE: Spliting data didn't help. It is better to keep full rows in the document.
 
     # Split the data
     # from langchain_text_splitters import RecursiveCharacterTextSplitter
     # text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=20)
     # docs = loader.load_and_split(text_splitter)
-    docs = loader.load()
+
+    # NOTE: Spliting data didn't help. It is better to keep full rows in the document.
 
     # The record manager is used to keep an index of the documents already added
     record_manager = SQLRecordManager(
-        f"lancedb/{COLLECTION_NAME}",
+        f"chroma/{COLLECTION_NAME}",
         db_url=f"sqlite:///{path}/record_manager_cache.sql",
     )
     record_manager.create_schema()
 
     # use index with a record manager to avoid data duplication
-    index(docs, record_manager, vector_store, source_id_key="row")
+    index(loader.load(), record_manager, vector_store, source_id_key="row")
 
     return vector_store
 
@@ -142,7 +139,7 @@ Neighborhood Description: Midtown is a vibrant and bustling neighborhood with a 
     return out.list
 
 
-def gen_image(prompt: str) -> ImageFile.ImageFile:
+def gen_image(prompt: str, seed: int = 1117389865) -> ImageFile.ImageFile:
     client = boto3.client("bedrock-runtime")
 
     response = client.invoke_model(
@@ -161,7 +158,7 @@ def gen_image(prompt: str) -> ImageFile.ImageFile:
                     quality="standard",
                     width=512,
                     height=512,
-                    seed=1117389865,
+                    seed=seed,
                 ),
             )
         ),

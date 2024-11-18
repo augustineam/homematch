@@ -87,7 +87,7 @@ To build the real state agent, we can start taking incremental steps:
 - Define the main aspects of the agent and familiarize with the LangChain & LangGraph framework.
 - Create the Agent graph using LangGraph.
 - Build a testing loop start interacting with the Agent.
-- Improve and refine the prompts and the control logic of the Agent until we get the desired behaviour.
+- Improve and refine the prompts and the control logic of the Agent until we get the desired behavior.
 
 ### The vector store and the record manager
 

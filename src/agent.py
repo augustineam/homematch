@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from typing import Annotated, Dict, List, Literal, Union
 from dotenv import load_dotenv
 
-from .utils import get_vector_store
+from .utils import get_vector_store, CSV_PATH
 
 import click
 import asyncio
@@ -266,23 +266,21 @@ async def cli_achat(vecstore_path: str, csv_path: str):
     show_default=True,
 )
 @click.option(
-    "vecstore_path",
     "--vecstore",
     default="./vecstore",
-    help="Path to vectorstore",
+    help="Path to vector store",
     show_default=True,
 )
 @click.option(
-    "csv_path",
     "--csv-path",
     default=str(CSV_PATH),
     help="Path to the CSV property listings file",
     show_default=True,
 )
-def chat(terminal: bool, vecstore_path: str, csv_path: str):
+def chat(terminal: bool, vecstore: str, csv_path: str):
     """Start HomeMatch AI agent"""
 
     if not terminal:
         raise NotImplementedError("Only terminal mode supported")
 
-    asyncio.run(cli_achat(vecstore_path, csv_path))
+    asyncio.run(cli_achat(vecstore, csv_path))
