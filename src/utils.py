@@ -4,14 +4,14 @@ from langchain_aws import ChatBedrockConverse
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
+from langchain_core.tools import tool, create_retriever_tool, Tool
 from langchain_community.document_loaders import CSVLoader
 
 from pydantic import BaseModel
 
-from typing import Literal, List, Union
+from typing import Literal, List, Union, Sequence
 from PIL import Image, ImageFile
 from pathlib import Path
-
 
 import boto3
 import json
@@ -41,6 +41,8 @@ def get_vector_store(
     csv_path: str,
     collection_name: str,
     embeddings: Embeddings,
+    source_id_key: str,
+    metadata_columns: Sequence[str] = (),
 ) -> Chroma:
     """Get the application vector store.
 
@@ -51,9 +53,13 @@ def get_vector_store(
     Args:
         path (str): The path to the vector store.
         csv_path (str): The path to the CSV file.
+        collection_name (str): The name of the collection.
+        embeddings (Embeddings): The embeddings model.
+        source_id_key (str): The key for the source ID in the CSV metadata.
+        metadata_columns (Sequence[str], optional): The columns to include as metadata. Defaults to ().
 
     Returns:
-        LanceDB: The vector store.
+        Chroma: The vector store.
     """
 
     os.makedirs(path, exist_ok=True)
@@ -62,14 +68,13 @@ def get_vector_store(
     vector_store = Chroma(collection_name, embeddings, persist_directory=path)
 
     # Load the data
-    loader = CSVLoader(file_path=csv_path)
+    loader = CSVLoader(file_path=csv_path, metadata_columns=metadata_columns)
 
     # Split the data
+    # NOTE: Spliting data didn't help. It is better to keep full rows in the document.
     # from langchain_text_splitters import RecursiveCharacterTextSplitter
     # text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=20)
     # docs = loader.load_and_split(text_splitter)
-
-    # NOTE: Spliting data didn't help. It is better to keep full rows in the document.
 
     # The record manager is used to keep an index of the documents already added
     record_manager = SQLRecordManager(
@@ -79,19 +84,16 @@ def get_vector_store(
     record_manager.create_schema()
 
     # use index with a record manager to avoid data duplication
-    index(loader.load(), record_manager, vector_store, source_id_key="row")
+    index(loader.load(), record_manager, vector_store, source_id_key=source_id_key)
 
     return vector_store
 
 
-from langchain_core.tools import tool, create_retriever_tool, Tool
-
-
 def get_retriever_tool(
-    property_listings: Chroma, listing_images: Union[Chroma, None] = None
+    property_listings: Chroma, with_row_number: bool = False
 ) -> Tool:
     listing_retriever = property_listings.as_retriever()
-    if listing_images is None:
+    if not with_row_number:
         return create_retriever_tool(
             listing_retriever,
             "retrieve_property_listings",
@@ -99,36 +101,67 @@ def get_retriever_tool(
         )
 
     @tool
-    def retriever_with_images(query: str):
-        """Queries and returns documents regarding property listings.
-        The documents include the filepaths to the listing images.
+    def retrieve_property_listings(query: str):
+        """Queries and returns documents regarding property listings with row number.
 
         Args:
             query (str): The query string used to retrieve the most relevant documents
 
         Returns:
-            str: The retrieved data including the most eye catchin image based on the query
+            str: The retrieved data including the row number
         """
 
         docs: List[Document] = listing_retriever.invoke(query)
+        return "\n\n".join(
+            f"Row: {doc.metadata["row"]}\n{doc.page_content}" for doc in docs
+        )
 
-        # Get most eye catching image based on the query but for
-        # the related document
-        image_idx = []
-        for doc in docs:
-            row = doc.metadata["row"]
-            img_doc = listing_images.similarity_search(
-                query, k=1, filter={"row": {"$eq": row}}
-            )[0]
-            image_idx.append(img_doc.metadata["pdx"])
+    return retrieve_property_listings
 
-        return "\n\n".join(doc.page_content + "" for doc in docs)
 
-    return retriever_with_images
+def gradio_add_listing_images(images_path: str, row: int) -> str:
+    """Add the image of a property listing to the HTML page.
+
+    Args:
+        images_path (str): Path to the images folder.
+        row (int): The row number of the listing to get the images.
+
+    Returns:
+        str: The formatted listing information as a HTML string.
+    """
+
+    image_tags = []
+    row_path = Path(f"{images_path}/row_{row:05d}")
+
+    if not row_path.exists():
+        return "> No images found for this listing."
+
+    for img_path in row_path.glob("*.png"):
+        with open(img_path, "rb") as f:
+            img_bytes = base64.b64encode(f.read())
+            base64_string = img_bytes.decode("ascii")
+
+        image_tags.append(
+            f"""<img src="data:image/png;base64,{base64_string}" style="width: 100%; height: auto; aspect-ratio: 1 / 1;" />"""
+        )
+
+    return f"""
+<div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
+{"\n".join(image_tags)}
+</div>
+<hr/>
+"""
 
 
 def gen_txt2img_prompts(description: str) -> List[ImagePrompt]:
-    """Create image prompt instructions for a txt2img model based on the listing description"""
+    """Create image prompt instructions for a txt2img model based on the listing description.
+
+    Args:
+        description (str): The listing description to use for the image prompts.
+
+    Returns:
+        List[ImagePrompt]: The image prompts to use for the txt2img model.
+    """
 
     llm = ChatBedrockConverse(
         model="mistral.mistral-large-2407-v1:0",
@@ -192,6 +225,16 @@ Neighborhood Description: Midtown is a vibrant and bustling neighborhood with a 
 
 
 def gen_image(prompt: str, seed: int = 1117389865) -> ImageFile.ImageFile:
+    """Generate an image based on the given prompt.
+
+    Args:
+        prompt (str): Prompt to generate an image with.
+        seed (int): Seed for the random number generator.
+
+    Returns:
+        ImageFile.ImageFile: Generated image.
+    """
+
     client = boto3.client("bedrock-runtime")
 
     response = client.invoke_model(

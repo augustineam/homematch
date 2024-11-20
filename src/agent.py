@@ -1,29 +1,26 @@
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.tools import create_retriever_tool, tool
+from langchain_core.tools import tool
 from langchain_core.messages import (
     SystemMessage,
     RemoveMessage,
     AIMessage,
     ToolMessage,
     HumanMessage,
+    AIMessageChunk,
 )
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import MessagesState, StateGraph, START, END
 from langgraph.prebuilt import ToolNode, InjectedState
-from langgraph.graph.state import CompiledStateGraph
+from langgraph.graph.state import CompiledStateGraph, RunnableConfig
 
 from pydantic import BaseModel, Field
 from typing import Annotated, Dict, List, Literal, Union
-from dotenv import load_dotenv
 
-from .utils import get_vector_store
+from .utils import get_vector_store, get_retriever_tool
 
-import click
-import asyncio
-
-load_dotenv(".env")
+import json
 
 
 __hmgraph: Union[None, CompiledStateGraph] = None
@@ -34,12 +31,19 @@ class AgentState(MessagesState):
     summary: str = ""
 
 
-def HomeMatchAgent(vecstore_path: str, csv_path: str) -> CompiledStateGraph:
+def HomeMatchAgent(
+    vecstore_path: str,
+    properties_csv: str,
+    with_images: bool = False,
+    agent_executor: bool = False,
+    config: Union[RunnableConfig, None] = None,
+) -> CompiledStateGraph:
     """Create the HomeMatch Real State AI Agent LangGraph.
 
     Args:
         vecstore_path (str): Path to the vector store.
-        csv_path (str): Path to the properties csv.
+        properties_csv (str): Path to the properties csv.
+        imgprompts_csv (str | None): Path to the imgprompts csv.
 
     Returns:
         CompiledStateGraph: The compiled state graph.
@@ -50,15 +54,14 @@ def HomeMatchAgent(vecstore_path: str, csv_path: str) -> CompiledStateGraph:
     if __hmgraph:
         return __hmgraph
 
-    vecstore = get_vector_store(
-        vecstore_path, csv_path, "property_listings", OpenAIEmbeddings()
+    agent_tools = []
+    embeddings = OpenAIEmbeddings()
+    property_listings = get_vector_store(
+        vecstore_path, properties_csv, "property_listings", embeddings, "row"
     )
 
-    retriever_tool = create_retriever_tool(
-        vecstore.as_retriever(),
-        "retrieve_property_listings",
-        "Queries and returns documents regarding property listings.",
-    )
+    # Append retriever tool
+    agent_tools.append(get_retriever_tool(property_listings, with_images))
 
     @tool
     def update_user_preferences(
@@ -69,12 +72,15 @@ def HomeMatchAgent(vecstore_path: str, csv_path: str) -> CompiledStateGraph:
         state.update(dict(preferences=preferences))
         return "User preferences updated successfully."
 
+    # Append user preference update tool
+    agent_tools.append(update_user_preferences)
+
     async def agent(state: AgentState):
         """Call the model's agent with the current state"""
 
         model = ChatOpenAI(
             model="gpt-3.5-turbo", temperature=0.5, max_tokens=1000
-        ).bind_tools([retriever_tool, update_user_preferences])
+        ).bind_tools(agent_tools)
 
         house_preferences = state.get("preferences", "No preferences provided.")
         summary = state.get("summary", "No conversation summary provided.")
@@ -109,9 +115,27 @@ The System will keep a record of the conversation history available to you in th
 5. Do you prefer a specific neighborhood or proximity to certain locations like schools or parks?
 
 **Retrieving Property Listings:**
-- Once you have gathered enough information about the user's preferences, retrieve relevant property listings that match their criteria.
+- Once you have gathered enough information about the user preferences, retrieve relevant property listings that match their criteria.
 - Present these listings to the user in a clear and engaging manner.
-- Ensure to highlight key features of each property that align with the user's preferences.
+- Ensure to highlight key features of each property that align with the user preferences.
+
+**IMPORTANT: Listings with Row:**
+When the listing is retrieved with row number, follow this instruction:
+
+- After presenting each listing, append the text `<<row_number>>` below the listing. This helps the system place the listing images correctly.
+
+For example:
+
+```plaintext
+1. **Colonial Style Home in the Suburbs**
+   - Price: $800,000
+   - Bedrooms: 4
+   - Bathrooms: 3
+   - Sqft: 3000
+   - Description: Beautiful colonial style home with traditional charm and modern updates. Large backyard perfect for outdoor entertaining.
+   - Neighborhood: Nestled in a quiet suburban area, close to schools and parks.
+<<34>>
+```
 
 **House Preferences:**
 {house_preferences}
@@ -212,7 +236,7 @@ You will produce one or more ideas and follow the format instructions to the let
     memory = MemorySaver()
     workflow = StateGraph(AgentState)
 
-    tool_node = ToolNode([retriever_tool, update_user_preferences])
+    tool_node = ToolNode(agent_tools)
 
     workflow.add_node("agent", agent)
     workflow.add_node("tools", tool_node)
@@ -223,7 +247,18 @@ You will produce one or more ideas and follow the format instructions to the let
     workflow.add_edge("tools", "agent")
     workflow.add_edge("summarize", END)
 
-    __hmgraph = workflow.compile(checkpointer=memory)
+    hmagent = workflow.compile(checkpointer=memory)
+
+    if config:
+        hmagent = hmagent.with_config(config)
+
+    if agent_executor:
+        from langchain.agents import AgentExecutor
+
+        __hmgraph = AgentExecutor(agent=hmagent, tools=agent_tools)
+    else:
+        __hmgraph = hmagent
+
     return __hmgraph
 
 
@@ -241,12 +276,32 @@ async def cli_achat(vecstore_path: str, csv_path: str):
         async for msg, _ in agent.astream(
             dict(messages=[input_message]), config, stream_mode="messages"
         ):
-            if (
-                msg.content
-                and not isinstance(msg, HumanMessage)
-                and not isinstance(msg, ToolMessage)
-            ):
-                print(msg.content, end="", flush=True)
+            if isinstance(msg, AIMessageChunk):
+
+                # FIXME: It is possible we are getting the a chunk with summary json...
+                # But what if the Agent sends a similar content that is not the summary?
+                # In whispers, he falls
+                # Empty nest, broken promise
+                # Honor's echo flees.
+                if msg.content.startswith("{") or json_chunk:
+                    json_chunk = json_chunk + msg.content
+                    if msg.content.endswith("}"):
+                        try:
+                            summary: Dict = json.loads(json_chunk)
+                            if "summary" not in summary:
+                                gathered = gathered + json_chunk
+                            else:
+                                print("Summary:\n", "\n".join(summary["summary"]))
+                                # FIXME: For some reason the summary is not updated
+                                # after adding the json_chunk fix...
+                                agent.update_state(config, values=summary)
+                        except json.decoder.JSONDecodeError:
+                            continue
+                    else:
+                        continue
+                else:
+                    finish_reason = msg.response_metadata.get("finish_reason", "")
+                    print() if finish_reason else print(msg.content, end="", flush=True)
 
         print()
         user_input = ""
@@ -257,140 +312,3 @@ async def cli_achat(vecstore_path: str, csv_path: str):
             break
 
         input_message = HumanMessage(content=user_input)
-
-
-@click.group()
-@click.option(
-    "--vecstore",
-    default="./vecstore",
-    help="Path to vector store",
-    show_default=True,
-)
-@click.pass_context
-def start(ctx: click.Context, vecstore: str):
-    """Start HomeMatch AI agent"""
-    ctx.obj["vecstore"] = vecstore
-
-
-@click.command()
-@click.pass_context
-def cli(ctx: click.Context):
-    """Chat with the HomeMatch agent in the command line interface."""
-
-    vecstore = ctx.obj["vecstore"]
-    properties_csv = ctx.obj["properties_csv"]
-
-    asyncio.run(cli_achat(vecstore, properties_csv))
-
-
-@click.command()
-@click.option(
-    "--port",
-    default=8080,
-    help="Port to run the server on.",
-    show_default=True,
-)
-@click.option(
-    "--host",
-    default="localhost",
-    help="Host to run the server on.",
-    show_default=True,
-)
-@click.pass_context
-def fastapi(ctx: click.Context, port: int, host: str):
-    """Serve HomeMatch agent as an API endopoint with LangServe and use the `/playground`."""
-
-    from fastapi import FastAPI
-    from langserve import add_routes
-    from langchain_core.runnables import RunnableLambda
-
-    from src.agent import HomeMatchAgent
-    from typing import Tuple
-
-    import uvicorn
-
-    app = FastAPI(
-        title="HomeMatch Server",
-        version="1.0",
-        description="A Real State AI Agent to help users find the house of their dreams.",
-    )
-
-    # from starlette.routing import Mount
-    # from starlette.applications import Starlette
-    # from starlette.staticfiles import StaticFiles
-    # app.mount("/", app=StaticFiles(directory="ui", html=True), name="HomeMatchUI")
-
-    vecstore = ctx.obj["vecstore"]
-    properties_csv = ctx.obj["properties_csv"]
-
-    class InputChat(BaseModel):
-        """Input for the chat endpoint."""
-
-        messages: List[Union[HumanMessage, AIMessage, SystemMessage]] = Field(
-            ...,
-            description="The chat messages representing the current conversation.",
-        )
-
-    def oup(state: Union[Dict, List]) -> str:
-        """Parse agent output and return its response.
-
-        The LangGraph can return either the `agent` (dict) update or
-        the `summarize` and `agent` updates (list)
-        """
-
-        if isinstance(state, list):
-            filterout = [s for s in state if s.get("agent", None)]
-            if 0 < len(filterout):
-                agent = filterout[0]["agent"]
-        elif isinstance(state, dict) and "agent" in state:
-            agent = state["agent"]
-        else:
-            return ""
-
-        messages = [m for m in agent["messages"] if isinstance(m, AIMessage)]
-        return messages[-1].content
-
-    config = dict(configurable=dict(thread_id=4))
-    agent = HomeMatchAgent(vecstore, properties_csv).pipe(RunnableLambda(oup))
-    add_routes(
-        app,
-        agent.with_config(config).with_types(input_type=InputChat, output_type=str),
-        enable_feedback_endpoint=True,
-        enable_public_trace_link_endpoint=True,
-        playground_type="chat",
-    )
-    uvicorn.run(app, host=host, port=port)
-
-
-@click.command()
-@click.pass_context
-def gradio(ctx: click.Context):
-    """Chat with the HomeMatch using the gradio UI."""
-    import gradio as gr
-
-    vecstore = ctx.obj["vecstore"]
-    properties_csv = ctx.obj["properties_csv"]
-
-    config = dict(configurable=dict(thread_id=4))
-    agent = HomeMatchAgent(vecstore, properties_csv)
-
-    async def invoke_agent(message, history):
-        print(message, history)
-
-        input_message = HumanMessage(content=message["text"])
-        output = await agent.ainvoke(dict(messages=[input_message]), config)
-
-        return (
-            output["messages"][-1].content
-            + '<br/><img src="http://localhost:7860/gradio_api/file=/tmp/gradio/8a5d4a95a69e808a9a63066481123df93b849b7775441ac8cb42b89215f1d4d7/pdx_6.png" alt="Building image"/>'
-        )
-
-    demo = gr.ChatInterface(
-        invoke_agent, multimodal=True, type="messages", title="HomeMatch Agent"
-    )
-    demo.launch()
-
-
-start.add_command(cli)
-start.add_command(fastapi)
-start.add_command(gradio)

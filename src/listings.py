@@ -222,19 +222,19 @@ import random
     show_default=True,
 )
 @click.option(
-    "--image-path",
+    "--images-path",
     default="data/images",
     help="Path to save generated images",
     show_default=True,
 )
-def generate_images(prompts_csv: str, image_path: str):
+def generate_images(prompts_csv: str, images_path: str):
     """Generate images from text prompts"""
 
     prompts_path = Path("data/imgprompts.csv")
     if not prompts_path.exists():
         raise FileNotFoundError(f"File {prompts_csv} not found.")
 
-    output_path = Path(image_path)
+    output_path = Path(images_path)
     output_path.mkdir(exist_ok=True)
 
     df_prompts = pd.read_csv(prompts_csv)
