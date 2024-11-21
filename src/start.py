@@ -1,3 +1,4 @@
+from langchain.callbacks.tracers import ConsoleCallbackHandler
 from langchain_core.messages import (
     SystemMessage,
     AIMessage,
@@ -26,13 +27,20 @@ load_dotenv(".env")
 @click.option(
     "--vecstore",
     default="./vecstore",
-    help="Path to vector store",
+    help="Path to vector store.",
     show_default=True,
 )
+@click.option(
+    "--trace",
+    default=False,
+    is_flag=True,
+    help="Shows the graph execution trace.",
+)
 @click.pass_context
-def start(ctx: click.Context, vecstore: str):
+def start(ctx: click.Context, vecstore: str, trace: bool):
     """Start HomeMatch AI agent"""
     ctx.obj["vecstore"] = vecstore
+    ctx.obj["trace"] = trace
 
 
 @click.command()
@@ -40,10 +48,11 @@ def start(ctx: click.Context, vecstore: str):
 def terminal(ctx: click.Context):
     """Chat with the HomeMatch agent from the terminal."""
 
+    trace = ctx.obj["trace"]
     vecstore = ctx.obj["vecstore"]
     properties_csv = ctx.obj["properties_csv"]
 
-    asyncio.run(cli_achat(vecstore, properties_csv))
+    asyncio.run(cli_achat(vecstore, properties_csv, trace))
 
 
 @click.command()
@@ -112,8 +121,14 @@ def langserve(ctx: click.Context, port: int, host: str):
         messages = [m for m in agent["messages"] if isinstance(m, AIMessage)]
         return messages[-1].content
 
-    config = dict(configurable=dict(thread_id=4))
-    agent = HomeMatchAgent(vecstore, properties_csv).pipe(RunnableLambda(oup))
+    trace = ctx.obj["trace"]
+    callbacks = [ConsoleCallbackHandler()] if trace else []
+
+    agent = HomeMatchAgent(
+        vecstore, properties_csv,
+        config=dict(configurable=dict(thread_id=4), callbacks=callbacks)
+    ).pipe(RunnableLambda(oup))
+
     add_routes(
         app,
         agent.with_config(config).with_types(input_type=InputChat, output_type=str),
@@ -135,24 +150,18 @@ def langserve(ctx: click.Context, port: int, host: str):
 def gradio(ctx: click.Context, images_path: str):
     """Chat with the HomeMatch agent from the gradio UI."""
 
-    # NOTE: To debug the graph's chain
-    # from langchain.globals import set_verbose
-    # from langchain.callbacks.tracers import ConsoleCallbackHandler
-
-    # set_verbose(True)
-    # config = dict(configurable=dict(thread_id=4), callbacks=[ConsoleCallbackHandler()])
-
     row_pattern = re.compile(r"<<(\d+)>>")
 
+    trace = ctx.obj["trace"]
     vecstore = ctx.obj["vecstore"]
     properties_csv = ctx.obj["properties_csv"]
-    config = dict(configurable=dict(thread_id=4))
 
+    callbacks = [ConsoleCallbackHandler()] if trace else []
     agent = HomeMatchAgent(
         vecstore,
         properties_csv,
         with_images=True,
-        config=config,
+        config=dict(configurable=dict(thread_id=4), callbacks=callbacks),
     )
 
     async def invoke_agent(message, history):
@@ -162,37 +171,15 @@ def gradio(ctx: click.Context, images_path: str):
         input_message = HumanMessage(content=message["text"])
 
         gathered = ""
-        json_chunk = ""
-        async for msg, _ in agent.astream(
+        async for msg, metadata in agent.astream(
             dict(messages=[input_message]), stream_mode="messages"
         ):
-            if isinstance(msg, AIMessageChunk):
-
-                # FIXME: It is possible we are getting the a chunk with summary json...
-                # But what if the Agent sends a similar content that is not the summary?
-                # In whispers, he falls
-                # Empty nest, broken promise
-                # Honor's echo flees.
-                if msg.content.startswith("{") or json_chunk:
-                    json_chunk = json_chunk + msg.content
-                    if msg.content.endswith("}"):
-                        try:
-                            summary: Dict = json.loads(json_chunk)
-                            if "summary" not in summary:
-                                gathered = gathered + json_chunk
-                            else:
-                                print("Summary:\n", "\n".join(summary["summary"]))
-                                # FIXME: For some reason the summary is not updated
-                                # after adding the json_chunk fix...
-                                agent.update_state(config, values=summary)
-                                yield gathered
-                        except json.decoder.JSONDecodeError:
-                            continue
-                    else:
-                        continue
-                else:
-                    finish_reason = msg.response_metadata.get("finish_reason", "")
-                    gathered = gathered + ("\n" if finish_reason else msg.content)
+            if (
+                isinstance(msg, AIMessageChunk)
+                and metadata["langgraph_node"] == "agent"
+            ):
+                finish_reason = msg.response_metadata.get("finish_reason", "")
+                gathered = gathered + ("\n" if finish_reason else msg.content)
 
                 # Replaces <<row_number>> pattern with the images in HTML.
                 rows = [row for row in row_pattern.findall(gathered)]
