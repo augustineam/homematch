@@ -12,6 +12,7 @@ from .utils import CSV_PATH
 from .utils import gen_txt2img_prompts, gen_image
 
 import click
+import random
 import pandas as pd
 
 
@@ -210,8 +211,6 @@ def image_prompts(properties_csv: str, imgprompts_csv: str):
         except Exception as e:
             print(f"Error ({e}): for row index {i}")
 
-
-import random
 
 
 @click.command()
