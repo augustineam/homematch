@@ -58,6 +58,8 @@ def HomeMatchAgent(
         with_images (bool): Whether to add image placeholder instruction.
         agent_executor (bool): Whether to use the agent executor.
         config (RunnableConfig | None): The runnable configuration.
+        image_index_data(str | None): Path to the data used to index the images.
+        image_index_method (Literal["images", "descriptions"]): The method to use for indexing images.
 
     Returns:
         CompiledStateGraph: The compiled state graph.
