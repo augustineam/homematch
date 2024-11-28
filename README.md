@@ -35,8 +35,16 @@ The project is structured into several key files:
    ```
 
 3. **Install requirements from `requirements.txt`**:
+
    ```sh
    pip install -r requirements.txt
+   ```
+
+4. **Create `.env` file with the following content**:
+
+   ```env
+   OPENAI_API_KEY=your_openai_api_key_here
+   OPENAI_API_BASE=your_openai_api_base_here
    ```
 
 ## Property Listings
