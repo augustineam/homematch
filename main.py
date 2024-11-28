@@ -1,5 +1,3 @@
-#!./pystack/bin/python
-
 from src.start import start
 from src.listings import listings
 

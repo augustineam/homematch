@@ -125,13 +125,14 @@ def langserve(ctx: click.Context, port: int, host: str):
     callbacks = [ConsoleCallbackHandler()] if trace else []
 
     agent = HomeMatchAgent(
-        vecstore, properties_csv,
-        config=dict(configurable=dict(thread_id=4), callbacks=callbacks)
+        vecstore,
+        properties_csv,
+        config=dict(configurable=dict(thread_id=4), callbacks=callbacks),
     ).pipe(RunnableLambda(oup))
 
     add_routes(
         app,
-        agent.with_config(config).with_types(input_type=InputChat, output_type=str),
+        agent.with_types(input_type=InputChat, output_type=str),
         enable_feedback_endpoint=True,
         enable_public_trace_link_endpoint=True,
         playground_type="chat",
@@ -146,8 +147,23 @@ def langserve(ctx: click.Context, port: int, host: str):
     help="Path where the listing images are stored.",
     show_default=True,
 )
+@click.option(
+    "--index-method",
+    default="descriptions",
+    help="Method used to index the image listings by using the images or the image descriptions.",
+    type=click.Choice(["images", "descriptions"]),
+    show_default=True,
+)
+@click.option(
+    "--index-data",
+    default="data/imgprompts.csv",
+    help="Path to the data where the image data is stored. CSV file for descriptions, and path to the images for images.",
+    show_default=True,
+)
 @click.pass_context
-def gradio(ctx: click.Context, images_path: str):
+def gradio(
+    ctx: click.Context, images_path: str, index_method: str, index_data: str
+) -> None:
     """Chat with the HomeMatch agent from the gradio UI."""
 
     row_pattern = re.compile(r"<<(\d+)>>")
@@ -161,6 +177,8 @@ def gradio(ctx: click.Context, images_path: str):
         vecstore,
         properties_csv,
         with_images=True,
+        image_index_data=index_data,
+        image_index_method=index_method,
         config=dict(configurable=dict(thread_id=4), callbacks=callbacks),
     )
 
@@ -168,7 +186,13 @@ def gradio(ctx: click.Context, images_path: str):
         # Unused argument
         history
 
-        input_message = HumanMessage(content=message["text"])
+        text = message.get("text", "")
+        files = message.get("files", [])
+
+        if files:
+            text += "\n\nShared files:\n" + "\n".join(f"File: {f}" for f in files)
+
+        input_message = HumanMessage(content=text)
 
         gathered = ""
         async for msg, metadata in agent.astream(
@@ -191,7 +215,10 @@ def gradio(ctx: click.Context, images_path: str):
                 yield gathered
 
     demo = gr.ChatInterface(
-        invoke_agent, multimodal=True, type="messages", title="HomeMatch Agent"
+        invoke_agent,
+        type="messages",
+        multimodal=True,
+        title="HomeMatch Agent",
     )
     demo.launch()
 

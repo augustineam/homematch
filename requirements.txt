@@ -27,3 +27,4 @@ torch==2.4.1
 torchvision
 torchaudio
 tqdm
+unstructured[all-docs]

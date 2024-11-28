@@ -5,14 +5,20 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
 from langchain_core.tools import tool, create_retriever_tool, Tool
+from langchain_experimental.open_clip import OpenCLIPEmbeddings
 from langchain_community.document_loaders import CSVLoader
 
 from pydantic import BaseModel
 
-from typing import Literal, List, Union, Sequence
+from pathlib import Path
+from typing import Literal
+
+from typing import Literal, List, Sequence
 from PIL import Image, ImageFile
 from pathlib import Path
 
+import regex as re
+import pandas as pd
 import boto3
 import json
 import base64
@@ -27,13 +33,6 @@ class ImagePrompt(BaseModel):
 
 class ImagePrompts(BaseModel):
     list: List[ImagePrompt]
-
-
-CSV_PATH = Path("./data/properties.csv")
-COLLECTION_NAME = "property_listings"
-
-VECSTORE_PATH = Path("vecstore")
-VECSTORE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 def get_vector_store(
@@ -101,7 +100,7 @@ def get_retriever_tool(
         )
 
     @tool
-    def retrieve_property_listings(query: str):
+    def retrieve_property_listings(query: str) -> str:
         """Queries and returns documents regarding property listings with row number.
 
         Args:
@@ -117,6 +116,182 @@ def get_retriever_tool(
         )
 
     return retrieve_property_listings
+
+
+def get_images_index(images_path: Path) -> pd.DataFrame:
+    """Get a dataframe the listing image paths.
+
+    Args:
+        images_path (Path): Root path where the images are stored.
+    """
+
+    pattern = re.compile(r".*\/row_(?<row>\d+)\/pdx_(?<pdx>\d+)\.png")
+    df = pd.DataFrame(columns=["id", "row", "pdx", "path"])
+
+    for path in images_path.glob("**/*.png"):
+        match = pattern.match(str(path))
+        if match:
+            row, pdx = match.groups()
+            id = f"{int(row)}_{pdx}"
+            df.loc[len(df)] = [id, int(row), int(pdx), str(path)]
+    df.sort_values(by=["row", "pdx"], inplace=True)
+    return df
+
+
+def add_images_to_vector_store(vecstore: Chroma, df: pd.DataFrame) -> None:
+    """Add the images to the vector store. Slower indexing and initialization. Bigger vector store.
+
+    Args:
+        vecstore (Chroma): Vector store with the CLIP embeddings function.
+        df (pd.DataFrame): DataFrame with the listing image paths.
+    """
+
+    # Don't duplicate data
+    dst_ids = vecstore.get(include=[])["ids"]
+    df = df[~df["id"].isin(dst_ids)]
+
+    if df.empty:
+        return
+
+    # Add images to vector store
+    vecstore.add_images(
+        df["path"].tolist(),
+        df[["row", "pdx"]].to_dict(orient="records"),
+        ids=df["id"].tolist(),
+    )
+
+
+def add_image_descriptions_to_vector_store(
+    vecstore: Chroma, imgprompts_csv: Path
+) -> None:
+    """Add the image descriptions to the vector store. Faster indexing and initialization. Smaller vector store.
+
+    Args:
+        vecstore (Chroma): Vector store with the CLIP embeddings function.
+        imgprompts_csv (Path): Path to the CSV with the image prompts, or image descriptions.
+    """
+
+    loader = CSVLoader(
+        imgprompts_csv,
+        metadata_columns=["id", "row", "pdx"],
+        content_columns=["prompt"],
+    )
+
+    path = vecstore._persist_directory.strip("/")
+    # The record manager is used to keep an index of the documents already added
+    record_manager = SQLRecordManager(
+        f"chroma/listing_images",
+        db_url=f"sqlite:///{path}/record_manager_cache.sql",
+    )
+    record_manager.create_schema()
+
+    # use index with a record manager to avoid data duplication
+    index(
+        loader.load(),
+        record_manager,
+        vecstore,
+        cleanup="incremental",
+        source_id_key="id",
+    )
+
+
+def add_listing_descriptions_to_vector_store(
+    vecstore: Chroma, properties_csv: Path
+) -> None:
+    """Add listing descriptions to the vector store with the CLIP embeddings function.
+
+    Args:
+        vecstore (Chroma): Vector store with the CLIP embeddigngs function.
+        properties_csv (Path): Path to the csv with the listing descriptions.
+    """
+
+    loader = CSVLoader(
+        properties_csv, content_columns=["Description", "Neighborhood Description"]
+    )
+
+    path = vecstore._persist_directory.strip("/")
+    # The record manager is used to keep an index of the documents already added
+    record_manager = SQLRecordManager(
+        f"chroma/listing_images",
+        db_url=f"sqlite:///{path}/record_manager_cache.sql",
+    )
+    record_manager.create_schema()
+
+    # use index with a record manager to avoid data duplication
+    index(
+        loader.load(),
+        record_manager,
+        vecstore,
+        cleanup="incremental",
+        source_id_key="row",
+    )
+
+
+def get_image_vector_store(
+    vecstore_path: str,
+    data_path: str,
+    method: Literal["images", "descriptions"] = "descriptions",
+) -> Chroma:
+    """Get the vector store based on the method used to add data.
+
+    Args:
+        vecstore_path (str): Path to the vector store.
+        data_path (str): Path to the data directory with the image paths or descriptions.
+        method (Literal["images", "descriptions"]): Method used to add data to the vector store.
+
+    Returns:
+        Chroma: Vector store with the CLIP embeddings function.
+    """
+
+    embeddings = OpenCLIPEmbeddings(
+        model_name="ViT-B-32", checkpoint="laion2b_s34b_b79k"
+    )
+    vecstore = Chroma(
+        persist_directory=vecstore_path,
+        collection_name="images",
+        embedding_function=embeddings,
+    )
+
+    if method == "images":
+        df = get_images_index(data_path)
+        add_images_to_vector_store(vecstore, df)
+    elif method == "descriptions":
+        add_image_descriptions_to_vector_store(vecstore, Path(data_path))
+    else:
+        raise ValueError("Invalid method. Use 'images' or 'descriptions'.")
+
+    return vecstore
+
+
+def get_retriever_by_image(images_vecstore: Chroma, listings_vecstore: Chroma) -> Tool:
+    """Get the retriever by image.
+    Args:
+        images_vecstore (Chroma): Vector store with the CLIP embeddings function.
+        listings_vecstore (Chroma): Vector store with the listings data.
+
+    Returns:
+        Tool: Retrieval tool for retrieving property listings by image.
+    """
+
+    @tool
+    def retrieve_by_image(image_url: str) -> str:
+        """Retrieve property listings by image"""
+
+        images = images_vecstore.similarity_search_by_image(image_url)
+        image_descriptions = [image.page_content for image in images]
+
+        rows = set(int(image.metadata["row"]) for image in images)
+        listing_descriptions: List[Document] = listings_vecstore.get(
+            where={"row": {"$in": list(rows)}}
+        )["documents"]
+
+        result = []
+        for row, listing in zip(rows, listing_descriptions):
+            result.append(f"Row:{row}\n{listing}")
+
+        return "\n\n".join(result)
+
+    return retrieve_by_image
 
 
 def gradio_add_listing_images(images_path: str, row: int) -> str:

@@ -1,12 +1,10 @@
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings, OpenAI
 from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.tools import tool
 from langchain_core.messages import (
     BaseMessage,
     SystemMessage,
     RemoveMessage,
     AIMessage,
-    ToolMessage,
     HumanMessage,
     AIMessageChunk,
 )
@@ -18,9 +16,14 @@ from langgraph.prebuilt import ToolNode
 from langgraph.graph.state import CompiledStateGraph, RunnableConfig
 
 from pydantic import BaseModel, Field
-from typing import List, Literal, Union, Any
+from typing import List, Literal, Union
 
-from .utils import get_vector_store, get_retriever_tool
+from .utils import (
+    get_vector_store,
+    get_retriever_tool,
+    get_image_vector_store,
+    get_retriever_by_image,
+)
 
 __hmgraph: Union[None, CompiledStateGraph] = None
 
@@ -43,6 +46,8 @@ def HomeMatchAgent(
     with_images: bool = False,
     agent_executor: bool = False,
     config: Union[RunnableConfig, None] = None,
+    image_index_data: str | None = None,
+    image_index_method: Literal["images", "descriptions"] = "descriptions",
 ) -> CompiledStateGraph:
     """Create the HomeMatch Real State AI Agent LangGraph.
 
@@ -50,6 +55,9 @@ def HomeMatchAgent(
         vecstore_path (str): Path to the vector store.
         properties_csv (str): Path to the properties csv.
         imgprompts_csv (str | None): Path to the imgprompts csv.
+        with_images (bool): Whether to add image placeholder instruction.
+        agent_executor (bool): Whether to use the agent executor.
+        config (RunnableConfig | None): The runnable configuration.
 
     Returns:
         CompiledStateGraph: The compiled state graph.
@@ -62,12 +70,20 @@ def HomeMatchAgent(
 
     agent_tools = []
     embeddings = OpenAIEmbeddings()
+
     property_listings = get_vector_store(
         vecstore_path, properties_csv, "property_listings", embeddings, "row"
     )
-
     # Append retriever tool
     agent_tools.append(get_retriever_tool(property_listings, with_images))
+
+    if with_images and image_index_data:
+        image_vector_store = get_image_vector_store(
+            vecstore_path, image_index_data, image_index_method
+        )
+        agent_tools.append(
+            get_retriever_by_image(image_vector_store, property_listings)
+        )
 
     async def agent(state: AgentState):
         """Call the model's agent with the current state"""
@@ -77,9 +93,8 @@ def HomeMatchAgent(
         ).bind_tools(agent_tools)
 
         if with_images:
-            image_placeholder = """**Row number placeholder:**
-Each property listing will be presented with a row number.
-Add a row number placeholder at the end of each listing.
+            image_placeholder = """- If the user shares an image, use the tool to find a similar property based on the image.
+- Make sure to include the row number placeholder at the end of each listing, **this is very important**.
 
 For example:
 
@@ -122,10 +137,9 @@ To complete the task successfully you have to use the information provided in th
 
 **Retrieving Property Listings:**
 
-- Retrieve relevant property listings that match their criteria
+- Retrieve relevant property listings that match their criteria.
 - Present these listings to the user in a clear and engaging manner.
 - Ensure to highlight key features of each property that align with the user preferences.
-
 {image_placeholder}
 """
         system_message = SystemMessage(content=system_prompt)

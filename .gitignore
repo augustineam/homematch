@@ -1,7 +1,6 @@
 __pycache__/
 node_modules/
 vecstore/
-pystack/
 data/
 .env
 *.rest

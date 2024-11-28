@@ -8,7 +8,6 @@ from tqdm import tqdm
 from typing import List
 from pathlib import Path
 
-from .utils import CSV_PATH
 from .utils import gen_txt2img_prompts, gen_image
 
 import click
@@ -145,7 +144,7 @@ def create(num_properties: int, properties_csv: str, append: bool):
 @click.command()
 @click.option(
     "--properties-csv",
-    default=str(CSV_PATH),
+    default="data/properties.csv",
     help="Path to the CSV property listings file",
     show_default=True,
 )
@@ -210,7 +209,6 @@ def image_prompts(properties_csv: str, imgprompts_csv: str):
 
         except Exception as e:
             print(f"Error ({e}): for row index {i}")
-
 
 
 @click.command()
